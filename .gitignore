@@ -1,0 +1,15 @@
+/*.db
+/.bloop
+/.bsp
+/.metals
+/.vscode
+/download
+/cache
+/temp
+/target
+/project/target
+/project/project
+/project/.bloop
+/*.exe
+/*.old
+/management_ext.dll
