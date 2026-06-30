@@ -3,4 +3,4 @@
 
 Check config/*.conf for available downloads and configurations.
 
-Delete 'data.db' file to clean download list.
+Delete 'data.db' file to clear download list.
