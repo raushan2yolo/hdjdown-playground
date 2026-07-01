@@ -242,7 +242,6 @@ final class PawchiveHandler(
       .removeHeader("Accept-Encoding")
       .addHeader(AcceptEncoding(AcceptEncoding.GZip(), AcceptEncoding.Deflate()))
       .removeHeader("Accept")
-      .addHeader("Accept", "text/css")
   
 
   import PawchiveHandler.*
