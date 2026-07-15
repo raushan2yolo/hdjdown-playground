@@ -17,6 +17,7 @@ val zioHttpVersion = "3.8.1"
 val zioConfigVersion = "4.0.7"
 val zioLoggingVersion = "2.5.3"
 
+val okhttp3Version = "5.4.0"
 
 assembly / assemblyJarName := "hdjdown-play.jar"
 
@@ -89,7 +90,9 @@ lazy val root = (project in file("."))
       //"org.jsoup" % "jsoup" % "1.22.1",
       "org.jsoup" % "jsoup" % "1.22.2",
       //"org.reflections" % "reflections" % "0.10.2"
-      "com.squareup.okhttp3" % "okhttp-jvm" % "5.4.0"
+      "com.squareup.okhttp3" % "okhttp-jvm" % okhttp3Version,
+      "com.squareup.okhttp3" % "okhttp-urlconnection" % okhttp3Version,
+      "com.squareup.okhttp3" % "okhttp-java-net-cookiejar" % okhttp3Version
     ),
     assembly / mainClass := Some("moe.karla.NativeMain")
     //assembly / mainClass := Some("moe.karla.AppMain")

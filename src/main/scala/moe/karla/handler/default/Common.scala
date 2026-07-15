@@ -11,7 +11,6 @@ import zio.config.refined.*
 import org.jsoup.nodes.Element
 
 import java.nio.file.*
-import zio.schema.Schema
 
 
 
@@ -35,7 +34,10 @@ object CommonConfig:
   val layer = ZLayer.fromZIO(load)
 
 
-import okhttp3.*
+import okhttp3.OkHttpClient
+import okhttp3.ConnectionSpec
+import okhttp3.TlsVersion
+import okhttp3.CipherSuite
 
 
 object OkHttpClient:
@@ -53,6 +55,7 @@ object OkHttpClient:
     ZIO.succeed:
       okhttp3.OkHttpClient.Builder()
         .connectionSpecs(java.util.Collections.singletonList(spec))
+        .cookieJar(new okhttp3.JavaNetCookieJar(new java.net.CookieManager()))
         .build()
   }
 
@@ -98,6 +101,7 @@ private[default] val defaultRetryFrequency =
   Schedule.fibonacci(800 millis)
 
 
+import zio.schema.Schema
 import zio.schema.codec.JsonCodec.*
 
 extension (resp: okhttp3.Response)

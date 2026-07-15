@@ -23,12 +23,15 @@ import zio.schema.codec.DecodeError
 import io.getquill.SnakeCase
 import io.getquill.jdbczio.Quill
 
+import okhttp3.OkHttpClient
+
 import scala.concurrent.duration.DurationInt
 
 import java.nio.file.*
 import java.nio.charset.StandardCharsets
 import java.sql.SQLException
 import java.util.UUID
+import java.net.CookieManager
 import java.net.MalformedURLException
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
@@ -42,6 +45,13 @@ object PawchiveHandler:
 
     final case class FanboxDownloadConfig(
       renameImages: Boolean,
+    )
+
+    final case class CloudflareConfig(
+
+      strategy: String,
+
+      providedCookies: String
     )
     
     final case class DownloadConfig(
@@ -69,7 +79,7 @@ object PawchiveHandler:
   
 
   import PawchiveConfig.DownloadConfig
-
+  import PawchiveConfig.CloudflareConfig
 
   final case class PawchiveConfig(
 
@@ -78,6 +88,8 @@ object PawchiveHandler:
     patterns: List[String],
 
     titlePattern: String,
+
+    cloudflare: CloudflareConfig,
 
     download: DownloadConfig
   )
@@ -93,6 +105,8 @@ object PawchiveHandler:
   final case class BypassError(message: String) extends RuntimeException(message)
 
   final case class LostMetaError(message: String) extends RuntimeException(message)
+
+  final case class TemporaryError(message: String) extends RuntimeException(message)
 
 
   trait IdleIndicator:
@@ -113,39 +127,42 @@ object PawchiveHandler:
   end IdleIndicatorLive
 
   /*
-  trait RequestCookiesHolder:
+  trait CookieInitializedIndicator:
 
-    def getCookies: UIO[Chunk[Cookie.Request]]
+    def isInitializd: UIO[Boolean]
 
-    def setCookies(cookies: Chunk[Cookie.Request]): UIO[Unit]
+    def setInitializd(value: Boolean): UIO[Unit]
   
-  end RequestCookiesHolder
+  end CookieInitializedIndicator
 
-  
-  final class RequestCookiesHolderLive(cookiesRef: Ref[Chunk[Cookie.Request]]) extends RequestCookiesHolder:
 
-    def getCookies: UIO[Chunk[Cookie.Request]] = cookiesRef.get
+  final class CookieInitializedIndicatorLive(ref: Ref[Boolean]) extends CookieInitializedIndicator: 
 
-    def setCookies(cookies: Chunk[Cookie.Request]): UIO[Unit] = 
-      cookiesRef.set(cookies)
+    def isInitializd = ref.get
+
+    def setInitializd(value: Boolean) = ref.set(value)
+
+  end CookieInitializedIndicatorLive
   */
 
   val layer: ZLayer[TaskHelper & AppConfig & CommonConfig, Nothing, PawchiveHandler] =
     ZLayer {
       for
-        PawchiveConfig <- PawchiveConfig.load.orDie
+        pawchiveConfig <- PawchiveConfig.load.orDie
         appConfig <- ZIO.service[AppConfig]
         commonConfig <- ZIO.service[CommonConfig]
         idleIndicator <- Ref.make(true).map(IdleIndicatorLive(_))
         //cookiesHolder <- Ref.make(Chunk.empty[Cookie.Request]).map(RequestCookiesHolderLive(_))
+        cookieInitialized <- Ref.make(false)
         taskHelper <- ZIO.service[TaskHelper]
       yield 
         PawchiveHandler(
           commonConfig,
-          PawchiveConfig, 
+          pawchiveConfig,
           appConfig.downPath, 
           appConfig.cachePath,
-          idleIndicator, 
+          idleIndicator,
+          cookieInitialized,
           taskHelper
         )
     }
@@ -216,6 +233,8 @@ final class PawchiveHandler(
 
   idleIndicator: PawchiveHandler.IdleIndicator,
 
+  cookieInitialized: Ref[Boolean],
+
   taskHelper: TaskHelper,
 
 ) extends moe.karla.handler.Handler:
@@ -235,6 +254,42 @@ final class PawchiveHandler(
       else str
 
 
+  private def configureRequest(url: URL, cookie: String = "") =
+    if (pawchiveConfig.cloudflare.strategy == "provided-cookies")
+      for
+        host <-
+          ZIO.attempt:
+              s"${url.host.get}${
+                url.port.map(i => if (i == 443 || i == 80) "" else s":${i}").getOrElse("")
+              }"
+            .mapError: _ =>
+              MalformedURLException(s"Extracting base url failed while parsing '${url}'")
+        //_ <- ZIO.log(s"Host: ${host}")
+        //_ <- ZIO.log(s"User-Agent: ${config.agent.getOrElse(defaultUserAgent)}")
+        builder = okhttp3.Request.Builder()
+        _ = {
+          if (cookie != "")
+            builder.addHeader("Cookie", cookie)
+        }
+      yield
+        builder
+          .url(url.encode)
+          .removeHeader("Accept")
+          .addHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+          .removeHeader("User-Agent")
+          .addHeader("User-Agent", pawchiveConfig.agent.getOrElse(commonConfig.defaultUserAgent))
+          //.removeHeader("Referer")
+          //.addHeader("Referer", url.encode)
+          .removeHeader("Host")
+          .addHeader("Host", host)
+          .removeHeader("Accecpt-Language")
+          .addHeader("Accept-Language", "zh-CN,zh;q=0.9,zh-TW;q=0.8,zh-HK;q=0.7,en-US;q=0.6,en;q=0.5")
+          .build()
+    else
+      ZIO.fail:
+        UnsupportedOperationException("Current strategy for bypassing cloudflare is not implemented")
+
+  /*
   private def configureRequest(url: URL) =
     Request.get(url)
       .removeHeader("User-Agent")
@@ -242,7 +297,7 @@ final class PawchiveHandler(
       .removeHeader("Accept-Encoding")
       .addHeader(AcceptEncoding(AcceptEncoding.GZip(), AcceptEncoding.Deflate()))
       .removeHeader("Accept")
-  
+  */
 
   import PawchiveHandler.*
 
@@ -309,23 +364,46 @@ final class PawchiveHandler(
         (base, profileApiEndpoint, postApiEndpoint, postFlag) = endpointsInfo
 
 
-        client<- ZIO.service[Client]
 
+        client <- ZIO.service[OkHttpClient]
+
+
+        cookied <- cookieInitialized.get
+
+        _ <- ZIO.when(!cookied)(
+          ZIO.log(s"Sending request to '${base}' for ensuring initial cookies(${pawchiveConfig.cloudflare.providedCookies}) are valid.") *>
+            configureRequest(base, pawchiveConfig.cloudflare.providedCookies)
+              .flatMap: req =>
+                ZIO.fromAutoCloseable:
+                  ZIO.attemptBlockingIO:
+                    client.newCall(req).execute()
+              .flatMap: resp =>
+                ZIO.when(resp.code() == 403)(
+                  ZIO.fail(BypassError(s"Anti-bots blocking presents on: '${base}'. => abort."))
+                )
+        )
+
+        //client<- ZIO.service[Client]
+        
         _ <- ZIO.log(s"Requesting api: '${profileApiEndpoint}'.")
 
         profileMeta <- 
-          client.request:
-              configureRequest(profileApiEndpoint)
+          configureRequest(profileApiEndpoint)
+            .flatMap: req =>
+              ZIO.fromAutoCloseable:
+                ZIO.attemptBlockingIO:
+                  client.newCall(req).execute()
             .flatMap: resp =>
-              resp.status.code match 
-              case 403 =>
-                ZIO.fail(BypassError(s"Anti-bots blocking presents when parsing: '${profileApiEndpoint}'"))
-              case 404 =>
-                ZIO.fail(ParsingError(s"404 not found presents when parsing: '${profileApiEndpoint}'"))
-              case i if i > 500 =>
-                ZIO.fail(ServerError(s"50x presents presents when parsing: '${profileApiEndpoint}'"))
-              case _ =>
-                resp.body.to[ApiProfileResp]
+              resp.code() match
+                case 403 =>
+                  ZIO.fail(BypassError(s"Anti-bots blocking presents when parsing: '${profileApiEndpoint}'"))
+                case 404 =>
+                  ZIO.fail(ParsingError(s"404 not found presents when parsing: '${profileApiEndpoint}'"))
+                case i if i > 500 =>
+                  ZIO.fail(ServerError(s"50x presents presents when parsing: '${profileApiEndpoint}'"))
+                case _ =>
+                  ZIO.fromEither:
+                    resp.to[ApiProfileResp].left.map(ParsingError(_))
             .tapError:
               case bp: (BypassError | ParsingError | DecodeError) =>
                 ZIO.logError(s"${bp.getMessage}. => abort.")
@@ -338,27 +416,32 @@ final class PawchiveHandler(
         
         tup <- {
           def fetchSchema[T](siteURL: URL)(using sc: Schema[T]): RIO[Scope, T] =
-            client.request:
-              configureRequest(siteURL)
-            .flatMap: resp =>
-              if (resp.status.code == 403)
-                ZIO.fail(BypassError(s"Anti-robots blocking presents while parsing: '${siteURL}'"))
-              else if (resp.status.code == 404)
-                ZIO.fail(ParsingError(s"404 not found presents while parsing: '${siteURL}'"))
-              else if (resp.status.code > 500)
-                ZIO.fail(ServerError(s"50x presents while parsing: '${siteURL}'"))
-              else resp.body.asString.flatMap: str =>
-                ZIO.fromEither:
-                  zio.schema.codec.JsonCodec.jsonDecoder(sc).decodeJson(str).left.map(ParsingError(_))
-            .tapError:
-              case bp: (BypassError | ParsingError | DecodeError) =>
-                ZIO.logError(s"${bp.getMessage}. => abort.")
-              case t =>
-                ZIO.logError(s"Exception is raised when parsing: '${siteURL}': ${t.getMessage}")
-            .defaultRetry
-            .tapSomeError:
-              case e if !e.isInstanceOf[BypassError | ParsingError | DecodeError] => 
-                ZIO.logError(s"Maximum number of retries has been reached while parsing: '${siteURL}'. => abort.")
+            configureRequest(siteURL)
+              .flatMap: req =>
+                ZIO.fromAutoCloseable:
+                  ZIO.attemptBlockingIO:
+                    client.newCall(req).execute
+              .flatMap: resp =>
+                resp.code() match
+                  case 403 =>
+                    ZIO.fail(BypassError(s"Anti-bots blocking presents when parsing: '${siteURL}'"))
+                  case 404 =>
+                    ZIO.fail(ParsingError(s"404 not found presents when parsing: '${siteURL}'"))
+                  case i if i > 500 =>
+                    ZIO.fail(ServerError(s"50x presents presents when parsing: '${siteURL}'"))
+                  case _ =>
+                    ZIO.fromEither:
+                      //zio.schema.codec.JsonCodec.jsonDecoder(sc).decodeJson(resp.body().string()).left.map(str => ParsingError(str))
+                      resp.to[T].left.map(str => ParsingError(str))
+              .tapError:
+                case bp: (BypassError | ParsingError | DecodeError) =>
+                  ZIO.logError(s"${bp.getMessage}. => abort.")
+                case t =>
+                  ZIO.logError(s"Exception is raised when parsing: '${siteURL}': ${t.getMessage}")
+              .defaultRetry
+              .tapSomeError:
+                case e if !e.isInstanceOf[BypassError | ParsingError | DecodeError] => 
+                  ZIO.logError(s"Maximum number of retries has been reached while parsing: '${siteURL}'. => abort.")
           end fetchSchema
 
           def buildTitle(postMeta: LesserPostMeta) =
@@ -461,9 +544,11 @@ final class PawchiveHandler(
         
       yield (parsedMeta, parsedPages)
     }
+    .provideSomeLayer:
+      moe.karla.handler.default.OkHttpClient.live
 
 
-  private def downloadSinglePage(title: String, page: MangaPage): RIO[zio.http.Client & Scope, Long] = {
+  private def downloadSinglePage(title: String, page: MangaPage): RIO[zio.http.Client & Scope, Long] = (
     for
       pageUrl <-
         ZIO.fromEither:
@@ -473,12 +558,15 @@ final class PawchiveHandler(
 
       _ <- ZIO.log(s"Downloading: '${pageUrl}'")
 
+      /*
       _client <- ZIO.service[Client]
 
       client = 
         _client @@ ZClientAspect.followRedirects(2)((resp, message) => 
           ZIO.logError(s"Redirect Error: ${message}").as(resp)
         )
+      */
+      client <- ZIO.service[OkHttpClient]
 
       cfile = s"${cachePath}/${UUID.randomUUID().toString()}.tmp"
 
@@ -489,30 +577,38 @@ final class PawchiveHandler(
           )
 
       length <-
-        client
-          .request(configureRequest(pageUrl))
-        .flatMap: resp =>
-          resp.status.code match 
-            case 403 =>
-              ZIO.fail(BypassError(s"Anti-bots blocking presents when downloading: '${pageUrl}'"))
-            case 404 =>
-              ZIO.fail(ParsingError(s"404 not found presents when downloading: '${pageUrl}'"))
-            case i if i > 500 =>
-              ZIO.fail(ServerError(s"50x presents presents when downloading: '${pageUrl}'"))
-            case _ =>
-              resp.body.asStream.tapSink(fireSink).timeout(4 hours).run(ZSink.fromFileName(cfile))
-        .onInterrupt: _ =>
-          defaultRemoveFile(cfile).forkDaemon
-        .tapError:
-          case bp: (BypassError | ParsingError) =>
-            ZIO.logError(s"${bp.getMessage}. => abort.")
-          case t =>
-            ZIO.logError(s"Exception is raised when downloading: '${pageUrl}': ${t.getMessage}")
-        .defaultRetry
-        .tapSomeError:
-          case e if !e.isInstanceOf[BypassError | ParsingError] => 
-            ZIO.logError(s"Maximum number of retries has been reached while downloading: '${pageUrl}'. => abort.")
-              *> defaultRemoveFile(cfile).forkDaemon
+        configureRequest(pageUrl)
+          .flatMap: req =>
+            ZIO.fromAutoCloseable:
+              ZIO.attemptBlockingIO:
+                client.newCall(req).execute
+          .flatMap: resp =>
+            resp.code() match 
+              case 403 =>
+                ZIO.fail(BypassError(s"Anti-bots blocking presents when downloading: '${pageUrl}'"))
+              case 404 =>
+                ZIO.fail(ParsingError(s"404 not found presents when downloading: '${pageUrl}'"))
+              case i if i > 500 =>
+                ZIO.fail(ServerError(s"50x presents presents when downloading: '${pageUrl}'"))
+              case _ =>
+                ZStream.fromInputStream(resp.body.byteStream).tapSink(fireSink).timeout(4 hours).run(ZSink.fromFileName(cfile))
+          .onInterrupt: _ =>
+            defaultRemoveFile(cfile).forkDaemon
+          .tapError:
+            case bp: (BypassError | ParsingError) =>
+              ZIO.logError(s"${bp.getMessage}. => abort.")
+            case t =>
+              ZIO.logError(s"Exception is raised when downloading: '${pageUrl}': ${t.toString}")
+          .defaultRetry
+          .tapSomeError:
+            case e if !e.isInstanceOf[BypassError | ParsingError] => 
+              ZIO.logError(s"Maximum number of retries has been reached while downloading: '${pageUrl}'. => abort.")
+                *> defaultRemoveFile(cfile).forkDaemon
+          .mapError:
+            case ep: (BypassError | ParsingError) =>
+              ep
+            case o =>
+              TemporaryError(o.toString)
 
       savedPath = s"${downPath}/${title}/${page.title}"
 
@@ -530,7 +626,9 @@ final class PawchiveHandler(
       _ <- ZIO.log(s"Saved: '${pageUrl}' as '${savedPath}', downloaded size: ${String.format("%.2f", length.toFloat / 1024 / 1024)} MB")
       
     yield length
-  }
+  )
+  .provideSomeLayer(moe.karla.handler.default.OkHttpClient.live)
+    
 
   end downloadSinglePage
 
