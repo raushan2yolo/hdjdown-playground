@@ -364,23 +364,24 @@ final class PawchiveHandler(
         (base, profileApiEndpoint, postApiEndpoint, postFlag) = endpointsInfo
 
 
-
-        client <- ZIO.service[OkHttpClient]
-
+        okClient <- ZIO.service[OkHttpClient]
 
         cookied <- cookieInitialized.get
 
-        _ <- ZIO.when(!cookied)(
-          ZIO.log(s"Sending request to '${base}' for ensuring initial cookies(${pawchiveConfig.cloudflare.providedCookies}) are valid.") *>
-            configureRequest(base, pawchiveConfig.cloudflare.providedCookies)
+        providedCookies = pawchiveConfig.cloudflare.providedCookies
+
+        _ <- ZIO.when(!cookied && providedCookies != "")(
+          ZIO.log(s"Sending request to '${base}' for ensuring initial cookies(${providedCookies}) are valid.") *>
+            configureRequest(base, providedCookies)
               .flatMap: req =>
                 ZIO.fromAutoCloseable:
                   ZIO.attemptBlockingIO:
-                    client.newCall(req).execute()
+                    okClient.newCall(req).execute()
               .flatMap: resp =>
                 ZIO.when(resp.code() == 403)(
                   ZIO.fail(BypassError(s"Anti-bots blocking presents on: '${base}'. => abort."))
                 )
+              *> cookieInitialized.set(true)
         )
 
         //client<- ZIO.service[Client]
@@ -392,7 +393,7 @@ final class PawchiveHandler(
             .flatMap: req =>
               ZIO.fromAutoCloseable:
                 ZIO.attemptBlockingIO:
-                  client.newCall(req).execute()
+                  okClient.newCall(req).execute()
             .flatMap: resp =>
               resp.code() match
                 case 403 =>
@@ -420,7 +421,7 @@ final class PawchiveHandler(
               .flatMap: req =>
                 ZIO.fromAutoCloseable:
                   ZIO.attemptBlockingIO:
-                    client.newCall(req).execute
+                    okClient.newCall(req).execute
               .flatMap: resp =>
                 resp.code() match
                   case 403 =>
@@ -566,7 +567,7 @@ final class PawchiveHandler(
           ZIO.logError(s"Redirect Error: ${message}").as(resp)
         )
       */
-      client <- ZIO.service[OkHttpClient]
+      okClient <- ZIO.service[OkHttpClient]
 
       cfile = s"${cachePath}/${UUID.randomUUID().toString()}.tmp"
 
@@ -581,7 +582,7 @@ final class PawchiveHandler(
           .flatMap: req =>
             ZIO.fromAutoCloseable:
               ZIO.attemptBlockingIO:
-                client.newCall(req).execute
+                okClient.newCall(req).execute
           .flatMap: resp =>
             resp.code() match 
               case 403 =>
