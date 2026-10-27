@@ -171,10 +171,11 @@ object PawchiveHandler:
   final case class FileMeta(
     name: Option[String],
     path: Option[String],
+    temp_url: Option[String],
   )
 
   final case class DefiniteFileMeta(
-    name: String, path: String,
+    name: String, path: String, 
   ):
     private[PawchiveHandler] def isCompressed = 
       name.endsWith(".zip") ||
@@ -462,9 +463,9 @@ final class PawchiveHandler(
                   _.path.isDefined
                 .distinct
                 .map: mt =>
-                  (mt.name, mt.path.get)
+                  (mt.name, mt.temp_url.orElse(mt.path.map(p => s"${base.encode.replace("https://", "https://file.")}/data/${p}")).get)
                 .map: (nameOption, mp) =>
-                  DefiniteFileMeta(nameOption.getOrElse(mp.substring(mp.lastIndexOf('/') + 1)), mp)
+                  DefiniteFileMeta(nameOption.getOrElse(new java.net.URI(mp).getPath.split('/').last), mp)
             (
               if (pawchiveConfig.download.ignoreArchive)
                 attachs.filterNot:
@@ -496,7 +497,7 @@ final class PawchiveHandler(
                 MangaPage(
                   0,
                   meta.id,
-                  s"${base.encode.replace("https://", "https://file.")}/data/${ath.path}",
+                  ath.path,
                   index + 1,
                   if (postFlag)
                     athName
